@@ -1,0 +1,60 @@
+# CI for flux-types
+#
+# Library crate. Depends on sibling `markdoc` via a relative
+# `path = "../markdoc"` reference, so CI checks out both repos
+# side-by-side before running cargo.
+#
+# Sibling repo is assumed to live in the same GitHub owner as this
+# repo (the `${{ github.repository_owner }}` substitution). Override
+# per-environment by editing the `repository:` line if you fork.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out flux-types
+        uses: actions/checkout@v4
+        with:
+          path: flux-types
+
+      - name: Check out sibling — markdoc
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/markdoc
+          path: markdoc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: flux-types
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo fmt --check
+        working-directory: flux-types
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        working-directory: flux-types
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: flux-types
+        run: cargo test --all-targets
