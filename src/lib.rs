@@ -36,31 +36,40 @@ use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Custom deserializer for `Option<u64>` fields. YAML integers come through
-/// the Markdoc Scalar pipeline as `f64`, so serde_json's strict u64
-/// deserializer rejects them ("invalid type: floating point `42.0`,
-/// expected u64"). Accept whole-number floats as long as they're in range.
+/// Custom deserializer for `Option<u64>` fields. These values arrive in
+/// several shapes across real documents, and a single malformed one must
+/// never sink the whole frontmatter parse — that would silently drop the
+/// title, dates and everything else (see the crate's "lenient" design
+/// note). So this is deliberately forgiving and never returns an error:
+///
+/// - absent / `null` / blank string → `None`
+/// - YAML integer (which the Markdoc Scalar pipeline delivers as `f64`)
+///   or a numeric string (`"75371702"`) → the parsed number
+/// - anything else — fractional, out of range, non-numeric text, an
+///   array, … → `None` rather than a hard failure
 fn deser_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    use serde::de::Error;
     let v = Option::<serde_json::Value>::deserialize(d)?;
-    match v {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Number(n)) => {
-            if let Some(u) = n.as_u64() {
-                return Ok(Some(u));
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(n)) => n.as_u64().or_else(|| {
+            // Whole-number floats in range are accepted; everything else
+            // (fractional, negative, overflowing) is dropped.
+            n.as_f64()
+                .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= u64::MAX as f64)
+                .map(|f| f as u64)
+        }),
+        // Authors routinely leave these fields blank (`""`) or quote the
+        // number; treat blank as unset and parse a numeric string.
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<u64>().ok()
             }
-            if let Some(f) = n.as_f64() {
-                if f.fract() == 0.0 && f >= 0.0 && f <= u64::MAX as f64 {
-                    return Ok(Some(f as u64));
-                }
-                return Err(D::Error::custom(format!(
-                    "expected a non-negative whole number, got {f}"
-                )));
-            }
-            Err(D::Error::custom("number out of range"))
         }
-        Some(other) => Err(D::Error::custom(format!("expected number, got {other:?}"))),
-    }
+        Some(_) => None,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -287,13 +296,13 @@ firstReleaseDate: "2024-07-30"
 updateDate: "2025-11-10"
 accessLevel: "public"
 tags:
-- "produtx"
+- "productx"
 - "manual"
 hwVersionRobot: "2.1"
 hwVersionTM: null
 swVersion: "3.x"
 products:
-- "ProdutX"
+- "ProductX"
 configFile: "products/productx/hw_2.1_config.json"
 documentHistory:
 - version: "5.3"
@@ -435,6 +444,35 @@ anotherUnknown: 42
     fn schema_version_round_trips() {
         let fm = parse_fm("schemaVersion: 2\ntitle: x\n");
         assert_eq!(fm.schema_version, Some(2));
+    }
+
+    #[test]
+    fn blank_number_fields_dont_sink_the_parse() {
+        // A blank numeric field (a common "left it empty" authoring case)
+        // must deserialize to None WITHOUT discarding the rest of the
+        // frontmatter — title and dates have to survive.
+        let fm = parse_fm(
+            r#"title: "How to replace a part"
+firstReleaseDate: "2026-05-20"
+documentNumber: ""
+orderNumber: ""
+"#,
+        );
+        assert_eq!(fm.title.as_deref(), Some("How to replace a part"));
+        assert_eq!(fm.first_release_date.as_deref(), Some("2026-05-20"));
+        assert_eq!(fm.document_number, None);
+        assert_eq!(fm.order_number, None);
+    }
+
+    #[test]
+    fn numeric_string_number_fields_parse() {
+        // Quoted numbers are accepted (YAML quoting is inconsistent in
+        // real docs); non-numeric text is dropped, not fatal.
+        let fm =
+            parse_fm("title: x\ndocumentNumber: \"75371702\"\norderNumber: \"not-a-number\"\n");
+        assert_eq!(fm.document_number, Some(75371702));
+        assert_eq!(fm.order_number, None);
+        assert_eq!(fm.title.as_deref(), Some("x"));
     }
 
     #[test]
